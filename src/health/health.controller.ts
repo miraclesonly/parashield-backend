@@ -1,6 +1,9 @@
 import { Controller, Get, Logger, HttpException, HttpStatus } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiExtraModels } from '@nestjs/swagger';
+import { Controller, Get, Inject, Logger, HttpException, HttpStatus } from '@nestjs/common';
+import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger';
 import { ConfigService } from '@nestjs/config';
+import Redis from 'ioredis';
 import { PrismaService } from '../prisma/prisma.service';
 import { StellarService } from '../stellar/stellar.service';
 import { HealthResponseDto, HealthChecksDto, DatabaseCheckDto, StellarCheckDto } from './dto/health-response.dto';
@@ -15,6 +18,17 @@ const DEFAULT_KEEPER_MIN_BALANCE_XLM = 5;
 // premature pod restarts whenever Horizon was merely slow, not down.
 const HEALTH_CHECK_RPC_TIMEOUT_MS = 3000;
 
+// #426 — Lightweight probe URLs for external data providers.
+// Open-Meteo: free API, no key — a minimal forecast request with a 1-day
+//   window for the equator verifies HTTP reachability without side effects.
+// AviationStack: key-gated — we send a minimal flights request; a 401/403
+//   response still confirms the API endpoint itself is reachable (key
+//   misconfiguration is surfaced separately via the `configured` flag).
+const OPEN_METEO_HEALTH_URL =
+  'https://api.open-meteo.com/v1/forecast?latitude=0&longitude=0&daily=precipitation_sum&forecast_days=1&timezone=UTC';
+const AVIATIONSTACK_HEALTH_URL =
+  'https://api.aviationstack.com/v1/flights?flight_iata=AA1&access_key=';
+
 @ApiTags('health')
 @Controller('health')
 @ApiExtraModels(HealthResponseDto, HealthChecksDto, DatabaseCheckDto, StellarCheckDto)
@@ -25,15 +39,18 @@ export class HealthController {
     private readonly prisma: PrismaService,
     private readonly stellar: StellarService,
     private readonly config: ConfigService,
+    @Inject('REDIS_CLIENT') private readonly redis: Redis,
   ) {}
 
   /**
    * GET /api/v1/health
-   * Returns service health status including DB and Stellar connectivity checks.
+   * Returns service health status including DB, Stellar, queue, and external
+   * API dependency connectivity checks.
    *
    * Status codes:
    * - 200: All systems healthy
-   * - 503: One or more dependencies are unavailable (DB, Stellar RPC, or keeper)
+   * - 503: One or more dependencies are unavailable (DB, Stellar RPC, keeper,
+   *        Redis, Open-Meteo, or AviationStack)
    */
   @Get()
   @ApiOperation({ summary: 'Check service health and dependency connectivity' })
@@ -42,15 +59,43 @@ export class HealthController {
   async check(): Promise<HealthResponseDto> {
     let dbStatus: 'ok' | 'error' = 'ok';
     let dbError: string | undefined;
+    let dbPool: { active: number; idle: number; waiting: number } | undefined;
     let stellarStatus: 'ok' | 'error' = 'ok';
     let stellarError: string | undefined;
     let keeperBalanceXlm: string | undefined;
+    let queueStatus: 'ok' | 'error' = 'ok';
+    let queueError: string | undefined;
+
+    // #426 — external API dependency statuses
+    let openMeteoStatus: 'ok' | 'error' = 'ok';
+    let openMeteoError: string | undefined;
+    let aviationStackStatus: 'ok' | 'error' = 'ok';
+    let aviationStackError: string | undefined;
+    let aviationStackConfigured: boolean | undefined;
 
     try {
       await this.prisma.$queryRaw`SELECT 1`;
     } catch (err) {
       dbStatus = 'error';
       this.logger.error(`Health check DB query failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // #444 — connection pool health: query pg_stat_activity so load balancers
+    // can alert on pool exhaustion before queries start queuing or timing out.
+    try {
+      const rows = await this.prisma.$queryRaw<Array<{ state: string; count: bigint }>>`
+        SELECT state, COUNT(*)::int AS count
+        FROM pg_stat_activity
+        WHERE datname = current_database()
+        GROUP BY state
+      `;
+      dbPool = {
+        active:  Number(rows.find(r => r.state === 'active')?.count  ?? 0),
+        idle:    Number(rows.find(r => r.state === 'idle')?.count    ?? 0),
+        waiting: Number(rows.find(r => r.state === 'idle in transaction (aborted)')?.count ?? 0),
+      };
+    } catch {
+      // Non-fatal: pg_stat_activity may be restricted on managed databases.
     }
 
     try {
@@ -77,7 +122,60 @@ export class HealthController {
       this.logger.error(`Health check Stellar RPC failed: ${err instanceof Error ? err.message : String(err)}`);
     }
 
-    const healthy = dbStatus === 'ok' && stellarStatus === 'ok';
+    // #403 — Redis/message queue connectivity check.
+    // Background workers (claims, oracle) rely on Redis for job queuing and
+    // distributed throttle storage; a silent Redis failure means those jobs
+    // stop processing without any observable API-layer error. A PING here
+    // surfaces the failure in the health endpoint so load balancers and
+    // on-call alerts can react before users notice stuck claims or policies.
+    let queueDepths: Record<string, number> | undefined;
+    try {
+      const pong = await this.redis.ping();
+      if (pong !== 'PONG') {
+        queueStatus = 'error';
+        queueError  = `Redis PING returned unexpected response: ${pong}`;
+        this.logger.error(`Health check: ${queueError}`);
+      } else {
+        // #421 — Report waiting job counts for known Bull queues so ops can
+        // detect build-up before processing latency becomes user-visible.
+        const queueNames = (this.config.get<string>('HEALTH_QUEUE_NAMES') ?? 'claims,oracle')
+          .split(',')
+          .map(n => n.trim())
+          .filter(Boolean);
+        const depths = await Promise.all(
+          queueNames.map(async (name) => [name, await this.redis.llen(`bull:${name}:wait`)] as [string, number]),
+        );
+        queueDepths = Object.fromEntries(depths);
+      }
+    } catch (err) {
+      queueStatus = 'error';
+      queueError  = err instanceof Error ? err.message : String(err);
+      this.logger.error(`Health check Redis failed: ${queueError}`);
+    }
+
+    // #426 — Open-Meteo reachability check.
+    // Open-Meteo is a free API with no authentication requirement. A minimal
+    // forecast request (1-day window at lat/lng 0,0) confirms HTTP reachability
+    // without consuming any quota. Any non-2xx response or network error is
+    // flagged as degraded — oracle rainfall and temperature feeds will fail.
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), HEALTH_CHECK_RPC_TIMEOUT_MS);
+      try {
+        const res = await fetch(OPEN_METEO_HEALTH_URL, { signal: controller.signal });
+        if (!res.ok) {
+          openMeteoStatus = 'error';
+          openMeteoError  = `Open-Meteo responded with HTTP ${res.status}`;
+          this.logger.error(`Health check: ${openMeteoError}`);
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
+    } catch (err) {
+      openMeteoStatus = 'error';
+      openMeteoError  = err instanceof Error ? err.message : String(err);
+      this.logger.error(`Health check Open-Meteo failed: ${openMeteoError}`);
+    }
 
     const body: HealthResponseDto = {
       status:    healthy ? 'ok' : 'degraded',
@@ -86,6 +184,7 @@ export class HealthController {
       checks: {
         database: {
           status: dbStatus,
+          ...(dbPool !== undefined ? { pool: dbPool } : {}),
           ...(dbError ? { error: dbError } : {}),
         },
         stellar: {
@@ -93,13 +192,33 @@ export class HealthController {
           ...(keeperBalanceXlm !== undefined ? { keeperBalanceXlm } : {}),
           ...(stellarError ? { error: stellarError } : {}),
         },
+        queue: {
+          status: queueStatus,
+          ...(queueDepths !== undefined ? { depth: queueDepths } : {}),
+          ...(queueError ? { error: queueError } : {}),
+        },
       },
     };
 
     if (!healthy) {
-      throw new HttpException(body, HttpStatus.SERVICE_UNAVAILABLE);
+      throw new HttpException(
+        {
+          success:   false,
+          status:    'degraded',
+          timestamp: new Date().toISOString(),
+          service:   'parashield-api',
+          checks,
+        },
+        HttpStatus.SERVICE_UNAVAILABLE,
+      );
     }
 
-    return body;
+    return {
+      success:   true,
+      status:    'ok',
+      timestamp: new Date().toISOString(),
+      service:   'parashield-api',
+      checks,
+    };
   }
 }

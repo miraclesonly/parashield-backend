@@ -39,22 +39,26 @@ import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { OperatorAuthGuard } from '../auth/operator-auth.guard';
 import { AuthenticatedRequest } from '../auth/authenticated-request';
 import { StatusEventsService } from '../common/events/status-events.service';
+import { PolicyStatusEventDto } from '../common/events/dto/sse-event.dto';
 
 @ApiTags('policy')
 @Controller()
 @ApiExtraModels(ResponseDto, PaginatedResponseDto, ProductResponseDto, PolicyResponseDto, CancellationResponseDto)
+@ApiExtraModels(ResponseDto, PaginatedResponseDto, ProductResponseDto, PolicyResponseDto, PolicyStatusEventDto)
 export class PolicyController {
   constructor(
     private readonly policy: PolicyService,
     private readonly statusEvents: StatusEventsService,
   ) {}
 
-  /** GET /api/v1/products — list all active insurance products */
+  /** GET /api/v1/products — list all active insurance products with pagination */
   @Get('products')
-  @ApiOperation({ summary: 'List all active insurance products' })
+  @ApiOperation({ summary: 'List all active insurance products with pagination' })
+  @ApiQuery({ name: 'page', required: false, description: 'Page number (default 1)', example: 1 })
+  @ApiQuery({ name: 'limit', required: false, description: 'Items per page, max 100 (default 20)', example: 20 })
   @ApiResponse({
     status: 200,
-    description: 'Returns list of active products',
+    description: 'Returns paginated products — { success, data, total, page, limit }',
     schema: {
       allOf: [
         { $ref: getSchemaPath(ResponseDto) },
@@ -66,9 +70,14 @@ export class PolicyController {
       ],
     },
   })
-  async getProducts() {
-    const products = await this.policy.getActiveProducts();
-    return { success: true, data: products };
+  async getProducts(
+    @Query('page') page: string = '1',
+    @Query('limit') limit: string = '20',
+  ) {
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
+    const result = await this.policy.getActiveProducts(pageNum, limitNum);
+    return { success: true, ...result };
   }
 
   /** GET /api/v1/policies/me?page=&limit= — get paginated policies for the authenticated wallet */
@@ -369,8 +378,30 @@ export class PolicyController {
   @Sse('policies/:id/events')
   @UseGuards(JwtAuthGuard)
   @ApiBearerAuth()
-  @ApiOperation({ summary: 'Server-Sent Events stream of status changes for a policy' })
+  @ApiOperation({
+    summary: 'Server-Sent Events stream of status changes for a policy',
+    description:
+      'Opens an SSE connection that streams policy status transitions in real time. ' +
+      'The current status is emitted immediately on connection, followed by events whenever the status changes. ' +
+      'Possible status values: ACTIVE, PROCESSING, CLAIMED, CANCELLED, EXPIRED.\n\n' +
+      'Event data schema:\n' +
+      '```json\n' +
+      '{ "policyId": "uuid", "status": "ACTIVE", "timestamp": 1700000000000 }\n' +
+      '```\n\n' +
+      'Connect with `EventSource`:\n' +
+      '```js\n' +
+      'const es = new EventSource("/api/v1/policies/:id/events", { withCredentials: true });\n' +
+      "es.onmessage = (e) => console.log(JSON.parse(e.data));\n" +
+      '```',
+  })
   @ApiParam({ name: 'id', description: 'Policy UUID' })
+  @ApiResponse({
+    status: 200,
+    description: 'SSE stream of PolicyStatusEvent objects. Each message has a `data` field containing the event payload.',
+    schema: { $ref: getSchemaPath(PolicyStatusEventDto) },
+  })
+  @ApiResponse({ status: 403, description: 'Policy belongs to a different wallet' })
+  @ApiResponse({ status: 404, description: 'Policy not found' })
   async policyStatusEvents(
     @Param('id') id: string,
     @Req() req: AuthenticatedRequest,
