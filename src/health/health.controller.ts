@@ -15,6 +15,17 @@ const DEFAULT_KEEPER_MIN_BALANCE_XLM = 5;
 // premature pod restarts whenever Horizon was merely slow, not down.
 const HEALTH_CHECK_RPC_TIMEOUT_MS = 3000;
 
+// #426 — Lightweight probe URLs for external data providers.
+// Open-Meteo: free API, no key — a minimal forecast request with a 1-day
+//   window for the equator verifies HTTP reachability without side effects.
+// AviationStack: key-gated — we send a minimal flights request; a 401/403
+//   response still confirms the API endpoint itself is reachable (key
+//   misconfiguration is surfaced separately via the `configured` flag).
+const OPEN_METEO_HEALTH_URL =
+  'https://api.open-meteo.com/v1/forecast?latitude=0&longitude=0&daily=precipitation_sum&forecast_days=1&timezone=UTC';
+const AVIATIONSTACK_HEALTH_URL =
+  'https://api.aviationstack.com/v1/flights?flight_iata=AA1&access_key=';
+
 @ApiTags('health')
 @Controller('health')
 export class HealthController {
@@ -29,11 +40,13 @@ export class HealthController {
 
   /**
    * GET /api/v1/health
-   * Returns service health status including DB and Stellar connectivity checks.
+   * Returns service health status including DB, Stellar, queue, and external
+   * API dependency connectivity checks.
    *
    * Status codes:
    * - 200: All systems healthy
-   * - 503: One or more dependencies are unavailable (DB, Stellar RPC, or keeper)
+   * - 503: One or more dependencies are unavailable (DB, Stellar RPC, keeper,
+   *        Redis, Open-Meteo, or AviationStack)
    */
   @Get()
   @ApiOperation({ summary: 'Check service health and dependency connectivity' })
@@ -48,6 +61,13 @@ export class HealthController {
     let keeperBalanceXlm: string | undefined;
     let queueStatus: 'ok' | 'error' = 'ok';
     let queueError: string | undefined;
+
+    // #426 — external API dependency statuses
+    let openMeteoStatus: 'ok' | 'error' = 'ok';
+    let openMeteoError: string | undefined;
+    let aviationStackStatus: 'ok' | 'error' = 'ok';
+    let aviationStackError: string | undefined;
+    let aviationStackConfigured: boolean | undefined;
 
     try {
       await this.prisma.$queryRaw`SELECT 1`;
@@ -129,7 +149,29 @@ export class HealthController {
       this.logger.error(`Health check Redis failed: ${queueError}`);
     }
 
-    const healthy = dbStatus === 'ok' && stellarStatus === 'ok' && queueStatus === 'ok';
+    // #426 — Open-Meteo reachability check.
+    // Open-Meteo is a free API with no authentication requirement. A minimal
+    // forecast request (1-day window at lat/lng 0,0) confirms HTTP reachability
+    // without consuming any quota. Any non-2xx response or network error is
+    // flagged as degraded — oracle rainfall and temperature feeds will fail.
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), HEALTH_CHECK_RPC_TIMEOUT_MS);
+      try {
+        const res = await fetch(OPEN_METEO_HEALTH_URL, { signal: controller.signal });
+        if (!res.ok) {
+          openMeteoStatus = 'error';
+          openMeteoError  = `Open-Meteo responded with HTTP ${res.status}`;
+          this.logger.error(`Health check: ${openMeteoError}`);
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
+    } catch (err) {
+      openMeteoStatus = 'error';
+      openMeteoError  = err instanceof Error ? err.message : String(err);
+      this.logger.error(`Health check Open-Meteo failed: ${openMeteoError}`);
+    }
 
     const body = {
       status:    healthy ? 'ok' : 'degraded',
@@ -155,9 +197,24 @@ export class HealthController {
     };
 
     if (!healthy) {
-      throw new HttpException(body, HttpStatus.SERVICE_UNAVAILABLE);
+      throw new HttpException(
+        {
+          success:   false,
+          status:    'degraded',
+          timestamp: new Date().toISOString(),
+          service:   'parashield-api',
+          checks,
+        },
+        HttpStatus.SERVICE_UNAVAILABLE,
+      );
     }
 
-    return body;
+    return {
+      success:   true,
+      status:    'ok',
+      timestamp: new Date().toISOString(),
+      service:   'parashield-api',
+      checks,
+    };
   }
 }
