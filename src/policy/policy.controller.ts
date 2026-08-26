@@ -33,7 +33,7 @@ import { PolicyService } from './policy.service';
 import { BuyPolicyDto } from './dto/buy-policy.dto';
 import { ConfirmPolicyDto } from './dto/confirm-policy.dto';
 import { CreateProductDto, UpdateProductDto } from './dto/admin-product.dto';
-import { ProductResponseDto, PolicyResponseDto } from './dto/policy-response.dto';
+import { ProductResponseDto, PolicyResponseDto, CancellationResponseDto } from './dto/policy-response.dto';
 import { ResponseDto, PaginatedResponseDto } from '../common/dto/response.dto';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { OperatorAuthGuard } from '../auth/operator-auth.guard';
@@ -42,7 +42,7 @@ import { StatusEventsService } from '../common/events/status-events.service';
 
 @ApiTags('policy')
 @Controller()
-@ApiExtraModels(ResponseDto, PaginatedResponseDto, ProductResponseDto, PolicyResponseDto)
+@ApiExtraModels(ResponseDto, PaginatedResponseDto, ProductResponseDto, PolicyResponseDto, CancellationResponseDto)
 export class PolicyController {
   constructor(
     private readonly policy: PolicyService,
@@ -271,7 +271,7 @@ export class PolicyController {
     schema: {
       allOf: [
         { $ref: getSchemaPath(ResponseDto) },
-        { properties: { data: { $ref: getSchemaPath(PolicyResponseDto) } } },
+        { properties: { data: { $ref: getSchemaPath(CancellationResponseDto) } } },
       ],
     },
   })
