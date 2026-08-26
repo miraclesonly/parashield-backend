@@ -6,6 +6,7 @@ import { GlobalExceptionFilter } from './common/filters/http-exception.filter';
 import { LoggingInterceptor } from './common/interceptors/logging.interceptor';
 import { BigIntSerializerInterceptor } from './common/interceptors/bigint-serializer.interceptor';
 import { ThrottleGuard } from './common/guards/throttle.guard';
+import { JsonLogger } from './common/logging/json-logger.service';
 import helmet from 'helmet';
 import { ConfigService } from '@nestjs/config';
 import { json, urlencoded } from 'express';
@@ -15,6 +16,9 @@ const SERVER_TIMEOUT_MS = 30_000;
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
+  // #352 — structured JSON logs instead of unstructured colored text, so a
+  // log aggregator (CloudWatch/Datadog/Loki/etc.) can actually parse them.
+  app.useLogger(new JsonLogger());
   const logger = new Logger('Bootstrap');
 
   const configService = app.get(ConfigService);
