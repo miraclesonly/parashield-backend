@@ -1,8 +1,9 @@
 import { Controller, Get, Logger, HttpException, HttpStatus } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger';
+import { ApiTags, ApiOperation, ApiResponse, ApiExtraModels } from '@nestjs/swagger';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 import { StellarService } from '../stellar/stellar.service';
+import { HealthResponseDto, HealthChecksDto, DatabaseCheckDto, StellarCheckDto } from './dto/health-response.dto';
 
 // #191 — default floor below which the keeper account is considered too low
 // to reliably keep paying transaction fees. Overridable via
@@ -16,6 +17,7 @@ const HEALTH_CHECK_RPC_TIMEOUT_MS = 3000;
 
 @ApiTags('health')
 @Controller('health')
+@ApiExtraModels(HealthResponseDto, HealthChecksDto, DatabaseCheckDto, StellarCheckDto)
 export class HealthController {
   private readonly logger = new Logger(HealthController.name);
 
@@ -35,9 +37,9 @@ export class HealthController {
    */
   @Get()
   @ApiOperation({ summary: 'Check service health and dependency connectivity' })
-  @ApiResponse({ status: 200, description: 'All systems healthy' })
-  @ApiResponse({ status: 503, description: 'Service degraded (one or more dependencies unavailable)' })
-  async check() {
+  @ApiResponse({ status: 200, description: 'All systems healthy', type: HealthResponseDto })
+  @ApiResponse({ status: 503, description: 'Service degraded (one or more dependencies unavailable)', type: HealthResponseDto })
+  async check(): Promise<HealthResponseDto> {
     let dbStatus: 'ok' | 'error' = 'ok';
     let dbError: string | undefined;
     let stellarStatus: 'ok' | 'error' = 'ok';
@@ -77,7 +79,7 @@ export class HealthController {
 
     const healthy = dbStatus === 'ok' && stellarStatus === 'ok';
 
-    const body = {
+    const body: HealthResponseDto = {
       status:    healthy ? 'ok' : 'degraded',
       timestamp: new Date().toISOString(),
       service:   'parashield-api',
